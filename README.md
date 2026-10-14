@@ -8,7 +8,7 @@ Share files to nearby devices. Free, open-source, cross-platform.
 Usage Notes:
 - Portable version does not require admin rights.  
 - Works on Windows [10](https://www.microsoft.com/en-us/software-download/windows10) & [11](https://www.microsoft.com/en-us/software-download/windows11) (ARM/64-bit).  
-- For help or updates, visit the official website or PortableApps.com forum.
+- For help or updates, visit the official website or [PortableApps.com forum](https://portableapps.com/node/79564).
 
 License:
 Open Source

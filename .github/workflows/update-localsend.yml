@@ -3,7 +3,7 @@ name: Update LocalSend
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 3 * * *"
 
 permissions:
   contents: write
@@ -23,6 +23,7 @@ jobs:
           fetch-depth: 0
 
       - name: Get latest stable release
+        id: release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,203 +50,202 @@ jobs:
           Write-Host "Latest stable version: $version"
 
       - name: Download and extract architecture ZIPs
-        id: download
         shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $version = "${{ steps.release.outputs.version }}"
-          $temp = Join-Path $env:RUNNER_TEMP "localsend-update"
-
-          New-Item -ItemType Directory -Force -Path $temp |
-            Out-Null
-
-          $headers = @{
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-
-          $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/localsend/localsend/releases/latest" `
-            -Headers $headers
+          $ErrorActionPreference = "Stop"
 
           $architectures = @{
-            x86-64 = "LocalSend64"
-            arm-64 = "LocalSendarm64"
+              "x86-64" = "LocalSend64"
+              "arm-64" = "LocalSendarm64"
           }
 
-          foreach ($arch in $architectures.Keys) {
-            $filename = "LocalSend-${version}-windows-${arch}.zip"
+          $root = $env:GITHUB_WORKSPACE
+          $temp = $env:RUNNER_TEMP
 
-            $asset = $release.assets |
-              Where-Object { $_.name -eq $filename } |
-              Select-Object -First 1
+          foreach ($arc in @("x86-64", "arm-64")) {
+              $folder = $architectures[$arc]
 
-            if (-not $asset) {
-              throw "Required release asset not found: $filename"
-            }
+              $zip = Join-Path $temp "LocalSend-$arc.zip"
+              $extract = Join-Path $temp "LocalSend-$arc"
+              $target = Join-Path $root "App\$folder"
 
-            $destination = Join-Path $temp $filename
+              $url = "https://github.com/localsend/localsend/releases/latest/download/LocalSend-$($env:VERSION)-windows-$arc.zip"
 
-            Write-Host "Downloading $filename"
+              Write-Host "Downloading $url"
 
-            Invoke-WebRequest `
-              -Uri $asset.browser_download_url `
-              -OutFile $destination
+              Invoke-WebRequest `
+                  -Uri $url `
+                  -OutFile $zip
 
-            if ((Get-Item $destination).Length -eq 0) {
-              throw "Downloaded file is empty: $filename"
-            }
-
-            $extract = Join-Path $temp $arch
-
-            New-Item -ItemType Directory -Force -Path $extract |
-              Out-Null
-
-            Expand-Archive `
-              -LiteralPath $destination `
-              -DestinationPath $extract `
-              -Force
-
-            $exe = Get-ChildItem -LiteralPath $extract `
-              -Filter "localsend_app.exe" `
-              -File -Recurse |
-              Select-Object -First 1
-
-            if (-not $exe) {
-              $exe = Get-ChildItem -LiteralPath $extract `
-                -Filter "*.exe" `
-                -File -Recurse |
-                Select-Object -First 1
-            }
-
-            if (-not $exe) {
-              throw "Executable not found in $filename"
-            }
-
-            $source = $exe.Directory.FullName
-            $target = Join-Path "App" $architectures[$arch]
-
-            New-Item -ItemType Directory -Force -Path $target |
-              Out-Null
-
-            # Preserve portable settings and marker.
-            Get-ChildItem -LiteralPath $target -Force |
-              Where-Object {
-                $_.Name -ne ".portable" -and
-                $_.Name -ne "settings"
-              } |
-              Remove-Item -Recurse -Force
-
-            # Copy files beside the executable.
-            Copy-Item `
-              -Path (Join-Path $source "*") `
-              -Destination $target `
-              -Recurse -Force
-
-            # Copy additional archive contents, if present.
-            Get-ChildItem -LiteralPath $extract -Force |
-              Where-Object {
-                $_.FullName -ne $source
-              } |
-              ForEach-Object {
-                Copy-Item `
-                  -LiteralPath $_.FullName `
-                  -Destination $target `
-                  -Recurse -Force
+              if (Test-Path $extract) {
+                  Remove-Item $extract -Recurse -Force
               }
 
-            Write-Host "Updated $target"
+              New-Item -ItemType Directory -Path $extract -Force |
+                  Out-Null
+
+              Expand-Archive `
+                  -LiteralPath $zip `
+                  -DestinationPath $extract `
+                  -Force
+
+              # Validate the extracted archive.
+              $exe = Get-ChildItem `
+                  -LiteralPath $extract `
+                  -Filter "*.exe" `
+                  -File `
+                  -Recurse |
+                  Select-Object -First 1
+
+              if (-not $exe) {
+                  throw "No EXE found in the $arc archive."
+              }
+
+              # Preserve portable metadata and settings.
+              $preserve = @()
+
+              if (Test-Path $target) {
+                  foreach ($name in @(".portable", "settings")) {
+                      $old = Join-Path $target $name
+
+                      if (Test-Path $old) {
+                          $backup = Join-Path $temp "$folder-preserve-$name"
+
+                          if (Test-Path $backup) {
+                              Remove-Item $backup -Recurse -Force
+                          }
+
+                          Copy-Item `
+                              -LiteralPath $old `
+                              -Destination $backup `
+                              -Recurse `
+                              -Force
+
+                          $preserve += @{
+                              Name = $name
+                              Backup = $backup
+                          }
+                      }
+                  }
+
+                  Remove-Item $target -Recurse -Force
+              }
+
+              New-Item -ItemType Directory -Path $target -Force |
+                  Out-Null
+
+              # Copy all extracted files, preserving archive structure.
+              Get-ChildItem -LiteralPath $extract -Force |
+                  Copy-Item -Destination $target -Recurse -Force
+
+              foreach ($item in $preserve) {
+                  $destination = Join-Path $target $item.Name
+
+                  if (Test-Path $destination) {
+                      Remove-Item $destination -Recurse -Force
+                  }
+
+                  Copy-Item `
+                      -LiteralPath $item.Backup `
+                      -Destination $destination `
+                      -Recurse `
+                      -Force
+              }
+
+              Write-Host "Updated $target"
           }
 
       - name: Update appinfo.ini version
         shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $version = "${{ steps.release.outputs.version }}"
+          $ErrorActionPreference = "Stop"
 
-          # Find appinfo.ini automatically.
           $files = Get-ChildItem `
-            -Path . `
-            -Filter "appinfo.ini" `
-            -File `
-            -Recurse |
-            Where-Object {
-              $_.FullName -notmatch '[\\/]\.git[\\/]'
-            }
+              -Path $env:GITHUB_WORKSPACE `
+              -Filter "appinfo.ini" `
+              -File `
+              -Recurse
 
           if (-not $files) {
-            throw "appinfo.ini was not found."
+              throw "appinfo.ini not found."
           }
 
-          $file = $files | Select-Object -First 1
-          $path = $file.FullName
+          foreach ($file in $files) {
+              $content = Get-Content -LiteralPath $file.FullName -Raw
 
-          Write-Host "Updating: $path"
+              if ($content -match '(?m)^\[Version\]\s*$') {
+                  $sectionPattern = '(?ms)(^\[Version\]\s*\r?\n)(.*?)(?=^\[|\z)'
 
-          $lines = Get-Content -LiteralPath $path
-          $inVersion = $false
-          $foundPackage = $false
-          $foundDisplay = $false
+                  $content = [regex]::Replace(
+                      $content,
+                      $sectionPattern,
+                      {
+                          param($match)
 
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            $line = $lines[$i].Trim()
+                          $section = $match.Groups[2].Value
 
-            if ($line -match '^\[Version\]$') {
-              $inVersion = $true
-              continue
-            }
+                          if ($section -match '(?m)^PackageVersion=') {
+                              $section = [regex]::Replace(
+                                  $section,
+                                  '(?m)^PackageVersion=.*$',
+                                  "PackageVersion=$env:VERSION"
+                              )
+                          } else {
+                              $section += "`r`nPackageVersion=$env:VERSION"
+                          }
 
-            if ($line -match '^\[.+\]$') {
-              $inVersion = $false
-            }
+                          if ($section -match '(?m)^DisplayVersion=') {
+                              $section = [regex]::Replace(
+                                  $section,
+                                  '(?m)^DisplayVersion=.*$',
+                                  "DisplayVersion=$env:VERSION"
+                              )
+                          } else {
+                              $section += "`r`nDisplayVersion=$env:VERSION"
+                          }
 
-            if ($inVersion -and
-                $line -match '^PackageVersion\s*=') {
-              $lines[$i] = "PackageVersion=$version"
-              $foundPackage = $true
-            }
+                          return $match.Groups[1].Value + $section
+                      }
+                  )
 
-            if ($inVersion -and
-                $line -match '^DisplayVersion\s*=') {
-              $lines[$i] = "DisplayVersion=$version"
-              $foundDisplay = $true
-            }
+                  Set-Content `
+                      -LiteralPath $file.FullName `
+                      -Value $content `
+                      -Encoding UTF8
+
+                  Write-Host "Updated version in $($file.FullName)"
+              }
           }
-
-          if (-not $foundPackage -or -not $foundDisplay) {
-            throw "PackageVersion or DisplayVersion missing in [Version]."
-          }
-
-          Set-Content `
-            -LiteralPath $path `
-            -Value $lines `
-            -Encoding UTF8
-
-          Write-Host "Updated PackageVersion=$version"
-          Write-Host "Updated DisplayVersion=$version"
 
       - name: Commit and push changes
         shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
-          git status --short
 
-          if (git diff --cached --quiet) {
-            Write-Host "No changes detected. Nothing to commit."
-            exit 0
+          git diff --cached --quiet
+
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "No changes to commit."
+              exit 0
           }
 
-          git commit -m "Update LocalSend to ${{ steps.release.outputs.version }}"
-
+          git commit -m "Update LocalSend to $env:VERSION"
           if ($LASTEXITCODE -ne 0) {
-            throw "Git commit failed."
+              throw "Git commit failed."
           }
 
-          git push origin "HEAD:${{ github.ref_name }}"
-
+          git push
           if ($LASTEXITCODE -ne 0) {
-            throw "Git push failed."
+              throw "Git push failed."
           }
-
-          Write-Host "Changes committed and pushed successfully."

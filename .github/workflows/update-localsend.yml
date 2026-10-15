@@ -1,1 +1,249 @@
+name: Update LocalSend
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-localsend
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest stable release
+        id: release
+        shell: pwsh
+        run: |
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/localsend/localsend/releases/latest" `
+            -Headers $headers
+
+          $version = $release.tag_name -replace '^v', ''
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Unexpected release version: $version"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Latest stable version: $version"
+
+      - name: Download and extract architecture ZIPs
+        id: download
+        shell: pwsh
+        run: |
+          $version = "${{ steps.release.outputs.version }}"
+          $temp = Join-Path $env:RUNNER_TEMP "localsend-update"
+
+          New-Item -ItemType Directory -Force -Path $temp |
+            Out-Null
+
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/localsend/localsend/releases/latest" `
+            -Headers $headers
+
+          $architectures = @{
+            x86-64 = "LocalSend64"
+            arm-64 = "LocalSendarm64"
+          }
+
+          foreach ($arch in $architectures.Keys) {
+            $filename = "LocalSend-${version}-windows-${arch}.zip"
+
+            $asset = $release.assets |
+              Where-Object { $_.name -eq $filename } |
+              Select-Object -First 1
+
+            if (-not $asset) {
+              throw "Required release asset not found: $filename"
+            }
+
+            $destination = Join-Path $temp $filename
+
+            Write-Host "Downloading $filename"
+
+            Invoke-WebRequest `
+              -Uri $asset.browser_download_url `
+              -OutFile $destination
+
+            if ((Get-Item $destination).Length -eq 0) {
+              throw "Downloaded file is empty: $filename"
+            }
+
+            $extract = Join-Path $temp $arch
+
+            New-Item -ItemType Directory -Force -Path $extract |
+              Out-Null
+
+            Expand-Archive `
+              -LiteralPath $destination `
+              -DestinationPath $extract `
+              -Force
+
+            $exe = Get-ChildItem -LiteralPath $extract `
+              -Filter "localsend_app.exe" `
+              -File -Recurse |
+              Select-Object -First 1
+
+            if (-not $exe) {
+              $exe = Get-ChildItem -LiteralPath $extract `
+                -Filter "*.exe" `
+                -File -Recurse |
+                Select-Object -First 1
+            }
+
+            if (-not $exe) {
+              throw "Executable not found in $filename"
+            }
+
+            $source = $exe.Directory.FullName
+            $target = Join-Path "App" $architectures[$arch]
+
+            New-Item -ItemType Directory -Force -Path $target |
+              Out-Null
+
+            # Preserve portable settings and marker.
+            Get-ChildItem -LiteralPath $target -Force |
+              Where-Object {
+                $_.Name -ne ".portable" -and
+                $_.Name -ne "settings"
+              } |
+              Remove-Item -Recurse -Force
+
+            # Copy files beside the executable.
+            Copy-Item `
+              -Path (Join-Path $source "*") `
+              -Destination $target `
+              -Recurse -Force
+
+            # Copy additional archive contents, if present.
+            Get-ChildItem -LiteralPath $extract -Force |
+              Where-Object {
+                $_.FullName -ne $source
+              } |
+              ForEach-Object {
+                Copy-Item `
+                  -LiteralPath $_.FullName `
+                  -Destination $target `
+                  -Recurse -Force
+              }
+
+            Write-Host "Updated $target"
+          }
+
+      - name: Update appinfo.ini version
+        shell: pwsh
+        run: |
+          $version = "${{ steps.release.outputs.version }}"
+
+          # Find appinfo.ini automatically.
+          $files = Get-ChildItem `
+            -Path . `
+            -Filter "appinfo.ini" `
+            -File `
+            -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]\.git[\\/]'
+            }
+
+          if (-not $files) {
+            throw "appinfo.ini was not found."
+          }
+
+          $file = $files | Select-Object -First 1
+          $path = $file.FullName
+
+          Write-Host "Updating: $path"
+
+          $lines = Get-Content -LiteralPath $path
+          $inVersion = $false
+          $foundPackage = $false
+          $foundDisplay = $false
+
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i].Trim()
+
+            if ($line -match '^\[Version\]$') {
+              $inVersion = $true
+              continue
+            }
+
+            if ($line -match '^\[.+\]$') {
+              $inVersion = $false
+            }
+
+            if ($inVersion -and
+                $line -match '^PackageVersion\s*=') {
+              $lines[$i] = "PackageVersion=$version"
+              $foundPackage = $true
+            }
+
+            if ($inVersion -and
+                $line -match '^DisplayVersion\s*=') {
+              $lines[$i] = "DisplayVersion=$version"
+              $foundDisplay = $true
+            }
+          }
+
+          if (-not $foundPackage -or -not $foundDisplay) {
+            throw "PackageVersion or DisplayVersion missing in [Version]."
+          }
+
+          Set-Content `
+            -LiteralPath $path `
+            -Value $lines `
+            -Encoding UTF8
+
+          Write-Host "Updated PackageVersion=$version"
+          Write-Host "Updated DisplayVersion=$version"
+
+      - name: Commit and push changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git status --short
+
+          if (git diff --cached --quiet) {
+            Write-Host "No changes detected. Nothing to commit."
+            exit 0
+          }
+
+          git commit -m "Update LocalSend to ${{ steps.release.outputs.version }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Git commit failed."
+          }
+
+          git push origin "HEAD:${{ github.ref_name }}"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Git push failed."
+          }
+
+          Write-Host "Changes committed and pushed successfully."

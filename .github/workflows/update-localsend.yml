@@ -3,7 +3,7 @@ name: Update LocalSend
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 6 * * *"
 
 permissions:
   contents: write
@@ -19,209 +19,231 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get latest stable release
         id: release
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $headers = @{
-              Accept = "application/vnd.github+json"
-              Authorization = "Bearer $env:GH_TOKEN"
-              "X-GitHub-Api-Version" = "2022-11-28"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
           }
 
           $release = Invoke-RestMethod `
-              -Uri "https://api.github.com/repos/localsend/localsend/releases/latest" `
-              -Headers $headers
+            -Uri "https://api.github.com/repos/localsend/localsend/releases/latest" `
+            -Headers $headers
 
           $version = $release.tag_name -replace '^v', ''
 
           if ($version -notmatch '^\d+\.\d+\.\d+$') {
-              throw "Unexpected release version: $version"
+            throw "Unexpected release version: $version"
           }
 
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$($release.tag_name)" >> $env:GITHUB_OUTPUT
 
-          Write-Host "Latest stable version: $version"
+          Write-Host "Latest LocalSend version: $version"
 
-      - name: Download and extract architecture ZIPs
+      - name: Download and update LocalSend architectures
+        id: download
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.release.outputs.version }}
-          TAG: ${{ steps.release.outputs.tag }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.release.outputs.version }}"
+          $temp = Join-Path $env:RUNNER_TEMP "localsend-update"
 
-          $headers = @{
-              Accept = "application/vnd.github+json"
-              Authorization = "Bearer $env:GH_TOKEN"
-              "X-GitHub-Api-Version" = "2022-11-28"
+          New-Item -ItemType Directory -Force -Path $temp | Out-Null
+
+          $architectures = @{
+            x64   = "LocalSend64"
+            arm64 = "LocalSendarm64"
           }
 
-          $release = Invoke-RestMethod `
-              -Uri "https://api.github.com/repos/localsend/localsend/releases/tags/$env:TAG" `
-              -Headers $headers
+          foreach ($arch in @("x64", "arm64")) {
+            if ($arch -eq "x64") {
+              $assetArch = "x86-64"
+            }
+            else {
+              $assetArch = "arm-64"
+            }
 
-          $architectures = @(
-              @{
-                  Suffix = "windows-x86-64.zip"
-                  Folder = "LocalSend64"
-              },
-              @{
-                  Suffix = "windows-arm-64.zip"
-                  Folder = "LocalSendarm64"
+            $filename = "LocalSend-$version-windows-$assetArch.zip"
+
+            $url = "https://github.com/localsend/localsend/releases/latest/download/$filename"
+
+            $zip = Join-Path $temp $filename
+            $extract = Join-Path $temp $arch
+
+            Write-Host "Downloading: $url"
+
+            Invoke-WebRequest `
+              -Uri $url `
+              -OutFile $zip `
+              -MaximumRedirection 10
+
+            if (-not (Test-Path -LiteralPath $zip) -or
+                (Get-Item -LiteralPath $zip).Length -eq 0) {
+              throw "Download failed or ZIP is empty: $filename"
+            }
+
+            # Validate ZIP integrity.
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+
+            try {
+              if ($archive.Entries.Count -eq 0) {
+                throw "ZIP archive is empty: $filename"
               }
-          )
+            }
+            finally {
+              $archive.Dispose()
+            }
 
-          foreach ($arch in $architectures) {
-              $asset = $release.assets |
-                  Where-Object {
-                      $_.name -eq "LocalSend-$env:VERSION-$($arch.Suffix)"
-                  } |
-                  Select-Object -First 1
+            # Extract the downloaded archive.
+            if (Test-Path -LiteralPath $extract) {
+              Remove-Item -LiteralPath $extract -Recurse -Force
+            }
 
-              if (-not $asset) {
-                  throw "Release asset not found: LocalSend-$env:VERSION-$($arch.Suffix)"
-              }
+            New-Item -ItemType Directory -Force -Path $extract | Out-Null
 
-              $zip = Join-Path $env:RUNNER_TEMP $asset.name
-              $extract = Join-Path $env:RUNNER_TEMP $arch.Folder
-              $target = Join-Path $env:GITHUB_WORKSPACE "App\$($arch.Folder)"
+            Expand-Archive `
+              -LiteralPath $zip `
+              -DestinationPath $extract `
+              -Force
 
-              Write-Host "Downloading $($asset.name)"
+            # Locate the actual LocalSend application directory.
+            $exe = Get-ChildItem `
+              -LiteralPath $extract `
+              -Filter "localsend_app.exe" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
 
-              Invoke-WebRequest `
-                  -Uri $asset.browser_download_url `
-                  -OutFile $zip
+            if (-not $exe) {
+              throw "localsend_app.exe not found in $filename"
+            }
 
-              if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-                  throw "Download failed: $($asset.name)"
-              }
+            $source = $exe.Directory.FullName
+            $target = Join-Path "App" $architectures[$arch]
 
-              if (Test-Path $extract) {
-                  Remove-Item $extract -Recurse -Force
-              }
+            if (-not (Test-Path -LiteralPath $target)) {
+              New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path $target | Out-Null
+            }
 
-              New-Item -ItemType Directory -Path $extract -Force |
-                  Out-Null
+            Write-Host "Updating $target"
 
-              Expand-Archive `
-                  -LiteralPath $zip `
-                  -DestinationPath $extract `
-                  -Force
+            # Remove old application files.
 
-              $exe = Get-ChildItem `
-                  -LiteralPath $extract `
-                  -Filter "*.exe" `
-                  -File `
-                  -Recurse |
-                  Select-Object -First 1
+            # Copy the new application files.
+            Get-ChildItem -LiteralPath $source -Force |
+              Copy-Item -Destination $target -Recurse -Force
 
-              if (-not $exe) {
-                  throw "No EXE found in $($asset.name)"
-              }
+            # Validate the updated application.
+            $updatedExe = Join-Path $target "localsend_app.exe"
 
-              if (Test-Path $target) {
-                  Remove-Item $target -Recurse -Force
-              }
+            if (-not (Test-Path -LiteralPath $updatedExe)) {
+              throw "LocalSend executable missing after update: $target"
+            }
 
-              New-Item -ItemType Directory -Path $target -Force |
-                  Out-Null
-
-              Get-ChildItem -LiteralPath $extract -Force |
-                  Copy-Item -Destination $target -Recurse -Force
-
-              if (-not (Get-ChildItem -LiteralPath $target -Filter "*.exe" -File -Recurse)) {
-                  throw "Extracted EXE missing from $target"
-              }
-
-              Write-Host "Successfully updated $($arch.Folder)"
+            Write-Host "Successfully updated $target"
           }
 
       - name: Update appinfo.ini version
         shell: pwsh
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.release.outputs.version }}"
 
+          # LocalSend uses a three-part version, e.g. 1.18.2.
+          $displayVersion = $version
+
+          # Find appinfo.ini automatically.
           $files = Get-ChildItem `
-              -Path $env:GITHUB_WORKSPACE `
-              -Filter "appinfo.ini" `
-              -File `
-              -Recurse
+            -Path . `
+            -Filter "appinfo.ini" `
+            -File `
+            -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]\.git[\\/]'
+            }
 
           if (-not $files) {
-              throw "appinfo.ini not found."
+            throw "appinfo.ini was not found anywhere in the repository."
           }
 
-          foreach ($file in $files) {
-              $content = Get-Content -LiteralPath $file.FullName -Raw
+          $file = $files | Select-Object -First 1
+          $path = $file.FullName
 
-              if ($content -match '(?m)^\[Version\]\s*$') {
-                  $pattern = '(?ms)(^\[Version\]\s*\r?\n)(.*?)(?=^\[|\z)'
+          Write-Host "Updating: $path"
 
-                  $content = [regex]::Replace(
-                      $content,
-                      $pattern,
-                      {
-                          param($match)
+          $lines = Get-Content -LiteralPath $path
 
-                          $section = $match.Groups[2].Value
+          $inVersion = $false
+          $foundPackage = $false
+          $foundDisplay = $false
 
-                          foreach ($key in @("PackageVersion", "DisplayVersion")) {
-                              if ($section -match "(?m)^$key=") {
-                                  $section = [regex]::Replace(
-                                      $section,
-                                      "(?m)^$key=.*$",
-                                      "$key=$env:VERSION"
-                                  )
-                              } else {
-                                  $section += "`r`n$key=$env:VERSION"
-                              }
-                          }
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i].Trim()
 
-                          return $match.Groups[1].Value + $section
-                      }
-                  )
+            if ($line -match '^\[Version\]$') {
+              $inVersion = $true
+              continue
+            }
 
-                  Set-Content `
-                      -LiteralPath $file.FullName `
-                      -Value $content `
-                      -Encoding UTF8
+            if ($line -match '^\[.+\]$') {
+              $inVersion = $false
+            }
 
-                  Write-Host "Updated $($file.FullName)"
-              }
+            if ($inVersion -and $line -match '^PackageVersion\s*=') {
+              $lines[$i] = "PackageVersion=$version"
+              $foundPackage = $true
+            }
+
+            if ($inVersion -and $line -match '^DisplayVersion\s*=') {
+              $lines[$i] = "DisplayVersion=$displayVersion"
+              $foundDisplay = $true
+            }
           }
+
+          if (-not $foundPackage -or -not $foundDisplay) {
+            throw "PackageVersion or DisplayVersion was not found in the [Version] section of $path"
+          }
+
+          # Replace only the existing version entries.
+          Set-Content -LiteralPath $path -Value $lines -Encoding UTF8
+
+          Write-Host "Updated PackageVersion=$version"
+          Write-Host "Updated DisplayVersion=$displayVersion"
 
       - name: Commit and push changes
         shell: pwsh
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $ErrorActionPreference = "Stop"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
 
-          git diff --cached --quiet
-          if ($LASTEXITCODE -eq 0) {
-              Write-Host "No changes to commit."
-              exit 0
+          git status --short
+
+          if (git diff --cached --quiet) {
+            Write-Host "No changes detected. Nothing to commit."
+            exit 0
           }
 
-          git commit -m "Update LocalSend to $env:VERSION"
+          git commit -m "Update LocalSend to ${{ steps.release.outputs.version }}"
+
           if ($LASTEXITCODE -ne 0) {
-              throw "Git commit failed."
+            throw "Git commit failed."
           }
 
-          git push
+          git push origin "HEAD:${{ github.ref_name }}"
+
           if ($LASTEXITCODE -ne 0) {
-              throw "Git push failed."
+            throw "Git push failed."
           }
+
+          Write-Host "LocalSend updated, committed and pushed successfully."

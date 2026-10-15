@@ -19,8 +19,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Get latest stable release
         id: release
@@ -30,8 +28,8 @@ jobs:
         run: |
           $headers = @{
               Accept = "application/vnd.github+json"
-              "X-GitHub-Api-Version" = "2022-11-28"
               Authorization = "Bearer $env:GH_TOKEN"
+              "X-GitHub-Api-Version" = "2022-11-28"
           }
 
           $release = Invoke-RestMethod `
@@ -52,32 +50,57 @@ jobs:
       - name: Download and extract architecture ZIPs
         shell: pwsh
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $architectures = @{
-              "x86-64" = "LocalSend64"
-              "arm-64" = "LocalSendarm64"
+          $headers = @{
+              Accept = "application/vnd.github+json"
+              Authorization = "Bearer $env:GH_TOKEN"
+              "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          $root = $env:GITHUB_WORKSPACE
-          $temp = $env:RUNNER_TEMP
+          $release = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/localsend/localsend/releases/tags/$env:TAG" `
+              -Headers $headers
 
-          foreach ($arc in @("x86-64", "arm-64")) {
-              $folder = $architectures[$arc]
+          $architectures = @(
+              @{
+                  Suffix = "windows-x86-64.zip"
+                  Folder = "LocalSend64"
+              },
+              @{
+                  Suffix = "windows-arm-64.zip"
+                  Folder = "LocalSendarm64"
+              }
+          )
 
-              $zip = Join-Path $temp "LocalSend-$arc.zip"
-              $extract = Join-Path $temp "LocalSend-$arc"
-              $target = Join-Path $root "App\$folder"
+          foreach ($arch in $architectures) {
+              $asset = $release.assets |
+                  Where-Object {
+                      $_.name -eq "LocalSend-$env:VERSION-$($arch.Suffix)"
+                  } |
+                  Select-Object -First 1
 
-              $url = "https://github.com/localsend/localsend/releases/latest/download/LocalSend-$($env:VERSION)-windows-$arc.zip"
+              if (-not $asset) {
+                  throw "Release asset not found: LocalSend-$env:VERSION-$($arch.Suffix)"
+              }
 
-              Write-Host "Downloading $url"
+              $zip = Join-Path $env:RUNNER_TEMP $asset.name
+              $extract = Join-Path $env:RUNNER_TEMP $arch.Folder
+              $target = Join-Path $env:GITHUB_WORKSPACE "App\$($arch.Folder)"
+
+              Write-Host "Downloading $($asset.name)"
 
               Invoke-WebRequest `
-                  -Uri $url `
+                  -Uri $asset.browser_download_url `
                   -OutFile $zip
+
+              if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+                  throw "Download failed: $($asset.name)"
+              }
 
               if (Test-Path $extract) {
                   Remove-Item $extract -Recurse -Force
@@ -91,7 +114,6 @@ jobs:
                   -DestinationPath $extract `
                   -Force
 
-              # Validate the extracted archive.
               $exe = Get-ChildItem `
                   -LiteralPath $extract `
                   -Filter "*.exe" `
@@ -100,61 +122,24 @@ jobs:
                   Select-Object -First 1
 
               if (-not $exe) {
-                  throw "No EXE found in the $arc archive."
+                  throw "No EXE found in $($asset.name)"
               }
 
-              # Preserve portable metadata and settings.
-              $preserve = @()
-
               if (Test-Path $target) {
-                  foreach ($name in @(".portable", "settings")) {
-                      $old = Join-Path $target $name
-
-                      if (Test-Path $old) {
-                          $backup = Join-Path $temp "$folder-preserve-$name"
-
-                          if (Test-Path $backup) {
-                              Remove-Item $backup -Recurse -Force
-                          }
-
-                          Copy-Item `
-                              -LiteralPath $old `
-                              -Destination $backup `
-                              -Recurse `
-                              -Force
-
-                          $preserve += @{
-                              Name = $name
-                              Backup = $backup
-                          }
-                      }
-                  }
-
                   Remove-Item $target -Recurse -Force
               }
 
               New-Item -ItemType Directory -Path $target -Force |
                   Out-Null
 
-              # Copy all extracted files, preserving archive structure.
               Get-ChildItem -LiteralPath $extract -Force |
                   Copy-Item -Destination $target -Recurse -Force
 
-              foreach ($item in $preserve) {
-                  $destination = Join-Path $target $item.Name
-
-                  if (Test-Path $destination) {
-                      Remove-Item $destination -Recurse -Force
-                  }
-
-                  Copy-Item `
-                      -LiteralPath $item.Backup `
-                      -Destination $destination `
-                      -Recurse `
-                      -Force
+              if (-not (Get-ChildItem -LiteralPath $target -Filter "*.exe" -File -Recurse)) {
+                  throw "Extracted EXE missing from $target"
               }
 
-              Write-Host "Updated $target"
+              Write-Host "Successfully updated $($arch.Folder)"
           }
 
       - name: Update appinfo.ini version
@@ -178,34 +163,26 @@ jobs:
               $content = Get-Content -LiteralPath $file.FullName -Raw
 
               if ($content -match '(?m)^\[Version\]\s*$') {
-                  $sectionPattern = '(?ms)(^\[Version\]\s*\r?\n)(.*?)(?=^\[|\z)'
+                  $pattern = '(?ms)(^\[Version\]\s*\r?\n)(.*?)(?=^\[|\z)'
 
                   $content = [regex]::Replace(
                       $content,
-                      $sectionPattern,
+                      $pattern,
                       {
                           param($match)
 
                           $section = $match.Groups[2].Value
 
-                          if ($section -match '(?m)^PackageVersion=') {
-                              $section = [regex]::Replace(
-                                  $section,
-                                  '(?m)^PackageVersion=.*$',
-                                  "PackageVersion=$env:VERSION"
-                              )
-                          } else {
-                              $section += "`r`nPackageVersion=$env:VERSION"
-                          }
-
-                          if ($section -match '(?m)^DisplayVersion=') {
-                              $section = [regex]::Replace(
-                                  $section,
-                                  '(?m)^DisplayVersion=.*$',
-                                  "DisplayVersion=$env:VERSION"
-                              )
-                          } else {
-                              $section += "`r`nDisplayVersion=$env:VERSION"
+                          foreach ($key in @("PackageVersion", "DisplayVersion")) {
+                              if ($section -match "(?m)^$key=") {
+                                  $section = [regex]::Replace(
+                                      $section,
+                                      "(?m)^$key=.*$",
+                                      "$key=$env:VERSION"
+                                  )
+                              } else {
+                                  $section += "`r`n$key=$env:VERSION"
+                              }
                           }
 
                           return $match.Groups[1].Value + $section
@@ -217,7 +194,7 @@ jobs:
                       -Value $content `
                       -Encoding UTF8
 
-                  Write-Host "Updated version in $($file.FullName)"
+                  Write-Host "Updated $($file.FullName)"
               }
           }
 
@@ -234,7 +211,6 @@ jobs:
           git add -A
 
           git diff --cached --quiet
-
           if ($LASTEXITCODE -eq 0) {
               Write-Host "No changes to commit."
               exit 0

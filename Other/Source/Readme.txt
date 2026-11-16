@@ -15,18 +15,18 @@ USER CONFIGURATION
 ==================
 
 Some configuration in the PortableApps.com Launcher can be overridden by the
-user in an INI file next to BatToExePortable.exe called BatToExePortable.ini.
+user in an INI file next to LocalSendPortable.exe called LocalSendPortable.ini.
 If you are happy with the default options, it is not necessary, though.  There
 is an example INI included with this package to get you started.  To use it,
-copy AppNamePortable.ini from this directory to BatToExePortable.ini next to
-BatToExePortable.exe. The options in the INI file are as follows:
+copy AppNamePortable.ini from this directory to LocalSendPortable.ini next to
+LocalSendPortable.exe. The options in the INI file are as follows:
 
    AdditionalParameters=
    DisableSplashScreen=false
    RunLocally=false
+   DownloadDir=
 
-(There is no need for an INI header in this file; if you have one, though, it
-won't damage anything.)
+(The header is madantory [LocalSendPortable])
 
 The AdditionalParameters entry allows you to pass additional command-line
 parameters to the application.
@@ -42,6 +42,9 @@ the application from a CD or if you work on a computer that may have spyware or
 viruses and you'd like to keep your device set to read-only. As a consequence
 of this technique, any changes you make during the Live mode session aren't
 saved back to your device.  The default is false.
+
+The DownloadDir is for settings custom download ir for LocalSend. if the value empty so the default download dir is Data\Downloads
+If you need current drive you can use like this `DownloadDir=Documents\Downloads` it's not recommended to use Local Drive or Other drives
 
 There may be other values also permitted in the user configuration file by the
 portable application; refer to help.html for any details of them.
